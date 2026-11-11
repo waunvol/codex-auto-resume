@@ -74,8 +74,9 @@ class PluginTests(unittest.TestCase):
             source=runtime/catalog['plugins'][0]['source']['path']
             self.assertTrue((source/'.codex-plugin/plugin.json').is_file())
             config=json.loads((source/'.mcp.json').read_text(encoding='utf-8'))['mcpServers']['resume']
-            self.assertEqual(config['args'][-1],str(runtime/'resume_mcp.py'))
-            self.assertEqual(config['env']['CODEX_HOME'],str(runtime.parents[2]))
+            # Windows TEMP 可能包含 RUNNER~1；生成器 resolve() 后采用长路径。比较位置而非别名字符串。
+            self.assertEqual(Path(config['args'][-1]).resolve(), (runtime/'resume_mcp.py').resolve())
+            self.assertEqual(Path(config['env']['CODEX_HOME']).resolve(), runtime.resolve().parents[2])
 
 
 if __name__=='__main__':unittest.main()
