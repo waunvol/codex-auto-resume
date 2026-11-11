@@ -17,7 +17,7 @@ SOURCE = Path(__file__).resolve().parent / 'src'
 sys.path.insert(0, str(SOURCE))
 from resume_platform import codex_home, lock_file, resolve_codex, quiet_options, atomic_replace
 
-FILES = ('codex_auto_resume.py', 'codex_resume_hook.py', 'resume_platform.py')
+FILES = ('codex_auto_resume.py', 'codex_resume_hook.py', 'resume_platform.py', 'resume_control.py', 'resume_dashboard.py', 'dashboard.html', 'resume_mcp.py', 'resume_plugin.py', 'resume_inbox.py')
 
 
 def atomic_json(path, data):
@@ -72,7 +72,7 @@ def merge_hooks(config, old_command, new_command, replace_command=None):
     return config
 
 
-def install(home, executable=None, uninstall=False, replace_command=None):
+def install(home, executable=None, uninstall=False, replace_command=None, runtime="auto"):
     home = home.expanduser().resolve()
     target = home / 'auto-resume'
     target.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -86,12 +86,12 @@ def install(home, executable=None, uninstall=False, replace_command=None):
         command = None
         manifest = {}
         if not uninstall:
-            cli = resolve_codex(executable)
+            cli = resolve_codex(executable, runtime=runtime)
             check = subprocess.run([*cli, '--version'], capture_output=True, text=True,
                                    encoding='utf-8', errors='replace', timeout=15, **quiet_options())
             if check.returncode or not check.stdout.strip().startswith('codex'):
-                raise ValueError('Codex CLI --version 校验失败：' + (check.stderr or check.stdout).strip())
-            settings = {'codex_command': cli}
+                raise ValueError('Codex 引擎 --version 校验失败：' + (check.stderr or check.stdout).strip())
+            settings = {'codex_command': cli, 'runtime': runtime}
             digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode())
             for name in FILES:
                 digest.update((SOURCE / name).read_bytes())
@@ -129,22 +129,48 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--codex-home', type=Path, default=codex_home())
     parser.add_argument('--codex-executable', help='codex/codex.exe 或官方 npm codex.cmd 的绝对路径')
+    parser.add_argument('--runtime', choices=['auto','desktop','cli'], default='auto', help='只安装桌面端时可选 desktop，无需另外安装 CLI')
+    parser.add_argument('--prompt-dir',type=Path,help='任务开始时在此目录按标题创建可编辑的恢复 prompt 文件')
+    parser.add_argument('--plugin', action='store_true', help='安装桌面内嵌 MCP Apps 插件，不启动 HTTP 面板')
+    parser.add_argument('--dashboard', action='store_true', help='重新启动或显示已安装的本地面板链接')
+    parser.add_argument('--no-dashboard', action='store_true', help='安装时暂不启动本地状态面板')
     parser.add_argument('--uninstall', action='store_true', help='移除本工具 hooks，保留记录和已安装版本')
     parser.add_argument('--replace-hook-command', help='迁移旧安装时，只替换完全匹配的旧 hook command')
     args = parser.parse_args()
     if sys.version_info < (3, 10):
         parser.error('需要 Python 3.10 或更新版本')
-    result = install(args.codex_home, args.codex_executable, args.uninstall, args.replace_hook_command)
+    if args.dashboard:
+        if args.uninstall:
+            parser.error('--dashboard 不能与 --uninstall 同时使用')
+        manifest = load_json(args.codex_home/'auto-resume/install.json', {})
+        if not manifest.get('installed'):
+            raise ValueError('请先运行安装器安装 hooks')
+        from resume_dashboard import ensure_dashboard
+        print(ensure_dashboard(Path(manifest['runtime'])/'resume_dashboard.py', args.codex_home))
+        return 0
+    result = install(args.codex_home, args.codex_executable, args.uninstall, args.replace_hook_command, args.runtime)
+    if args.prompt_dir and not args.uninstall:
+        prompt_dir=args.prompt_dir.expanduser().resolve(); prompt_dir.mkdir(parents=True,exist_ok=True)
+        atomic_json(args.codex_home.expanduser().resolve()/'auto-resume/preferences.json',{'prompt_dir':str(prompt_dir)})
+        print('任务 prompt 目录：'+str(prompt_dir))
     print('已卸载 hooks；历史记录和备份保留。' if args.uninstall else
-          '安装完成。请运行 codex，在 /hooks 中信任并启用 UserPromptSubmit、Stop，然后重启 Codex App。')
+          '安装完成。桌面端请到 Settings > Hooks 信任并启用 UserPromptSubmit、Stop；CLI 使用 /hooks。重启已打开的 App。')
     if result:
         print('运行目录：' + result['runtime'])
+        if args.plugin:
+            from resume_plugin import install_plugin
+            print('桌面插件已安装：' + install_plugin(result['runtime'], result['codex_command'], args.codex_home))
+            print('重启 App 后，从恢复控制台的侧栏或对话面板入口直接打开。')
+        elif not args.no_dashboard:
+            from resume_dashboard import ensure_dashboard
+            print('任务控制面板（可在 Codex 内置浏览器打开）：' + ensure_dashboard(
+                Path(result['runtime'])/'resume_dashboard.py', args.codex_home))
     return 0
 
 
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (ValueError, OSError, subprocess.SubprocessError) as error:
+    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         print('安装失败：' + str(error), file=sys.stderr)
         sys.exit(1)

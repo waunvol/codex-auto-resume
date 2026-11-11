@@ -34,6 +34,7 @@ for line in sys.stdin:
         thread = params.get('threadId', thread)
         result = {'thread': {'id': thread, 'cwd': os.getcwd(), 'status': {'type': 'idle'}}}
     elif method == 'turn/start':
+        (root/'last_prompt.json').write_text(json.dumps(params),encoding='utf-8')
         turn = {'id': 'continued', 'status': 'completed'}
         send({'id': msg['id'], 'result': {'turn': turn}})
         send({'method': 'item/completed', 'params': {'threadId': thread, 'turnId': turn['id'],

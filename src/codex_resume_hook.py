@@ -11,6 +11,7 @@ import sys
 import time
 
 import codex_auto_resume as runner
+from resume_inbox import task_title, create_prompt, clean_prompt
 
 ROOT = state_root()
 
@@ -62,6 +63,7 @@ def worker(folder):
             if context:
                 policy = context.get('sandbox_policy') or {}
                 job.save(workspace_write=policy.get('type') == 'workspace-write')
+        create_prompt(job, event.get('title') or 'Codex任务')
         if job.state['status'] not in runner.ACTIVE_STATES:
             return
         # 同一聊天的新轮次等待旧守候观察到新事件并释放锁；不同聊天互不等待。
@@ -77,6 +79,8 @@ def worker(folder):
         try:
             asyncio.run(runner.run(job))
         finally:
+            if job.state["status"] not in runner.ACTIVE_STATES:
+                clean_prompt(job)
             job.close()
 
 
@@ -104,6 +108,7 @@ def main():
             if not (folder / 'event.json').exists():
                 # 不重复保存 prompt，恢复依据原会话历史。
                 minimal = {k:event[k] for k in ('session_id','turn_id','cwd','transcript_path','model') if k in event}
+                minimal['title']=task_title(event)
                 (folder / 'event.json').write_text(json.dumps(minimal), encoding='utf-8')
                 with (folder / 'runner.log').open('ab') as log:
                     subprocess.Popen([sys.executable, "-X", "utf8", str(Path(__file__).resolve()), 'worker', str(folder)],

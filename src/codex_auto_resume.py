@@ -2,6 +2,8 @@
 """在 Codex 订阅额度恢复后继续已登记的本地任务。"""
 
 import argparse
+from resume_control import permitted, read_control, prompt_snapshot
+from resume_inbox import submitted_snapshot, clean_prompt
 import asyncio
 from collections import deque
 from datetime import datetime
@@ -290,6 +292,7 @@ def settle_turn(job, turn, answer):
     if turn["status"] != "completed":
         raise Blocked(error.get("message") or f"轮次状态为 {turn['status']}")
 
+    clean_prompt(job, consumed=True)
     try:
         result = json.loads(answer or "")
     except json.JSONDecodeError as error:
@@ -355,6 +358,9 @@ async def run_turn(server, job):
     # 额度等待或连接握手期间，用户可能已经手动继续。
     if not check_watched_turn(job):
         return
+    if not permitted(job.path, job.state.get("applied_control_id")):
+        return
+    control = read_control(job.path)
     state = job.state
     thread_id = state["thread_id"]
     sandbox = {
@@ -388,6 +394,12 @@ async def run_turn(server, job):
             "\n当前工作包\n" + json.dumps(worker, ensure_ascii=False)
         )
 
+    try:
+        extra, prompt_id = prompt_snapshot(control)
+    except (OSError, ValueError) as error:
+        raise Blocked(f"无法读取恢复 prompt 文件：{error}") from error
+    if prompt_id != state.get('applied_prompt_id') and extra.strip():
+        prompt += "\n用户追加的恢复指令（遵守原授权边界）：\n" + extra
     events = deque()
 
     def keep_event(message):
@@ -397,7 +409,8 @@ async def run_turn(server, job):
         ):
             events.append(message)
 
-    job.save(status="running", turn_id=None, retry_at=None)
+    job.save(status="running", turn_id=None, retry_at=None, applied_control_id=control["revision"], applied_prompt_id=prompt_id,
+             inbox_submission=submitted_snapshot(state,control,extra))
     started = await server.request("turn/start", {
         "threadId": thread_id,
         "input": [{"type": "text", "text": prompt}],
@@ -432,13 +445,13 @@ async def drive(server, job):
     await server.send({"method": "initialized"})
     account = await server.request("account/read", {"refreshToken": False})
     if (account.get("account") or {}).get("type") != "chatgpt":
-        raise Blocked("需要用 ChatGPT 账户登录本机 Codex CLI。")
+        raise Blocked("请先在桌面 App 或本机 Codex CLI 中登录同一 ChatGPT 账户。")
 
     if job.state["status"] == "running":
         await recover_turn(server, job)
     loaded = False
     while job.state["status"] in {"pending", "running", "waiting_quota"}:
-        if not check_watched_turn(job):
+        if not check_watched_turn(job) or not permitted(job.path, job.state.get("applied_control_id")):
             return
         try:
             limits = await server.request("account/rateLimits/read", {})
@@ -514,8 +527,12 @@ async def run(job):
                 if job.state["status"] == "watching":
                     await asyncio.sleep(2)
                 continue
+            # 已提交轮次的结果核对不能被新的暂停设置阻止；暂停只控制后续提交。
+            if job.state["status"] != "running" and not permitted(job.path, job.state.get("applied_control_id")):
+                await asyncio.sleep(2)
+                continue
             if (delay := (job.state.get("retry_at") or 0) - time.time()) > 0:
-                await asyncio.sleep(min(delay, 2 if job.state.get("watch_turn_id") else 60))
+                await asyncio.sleep(min(delay, 2))
                 continue
             if job.state["status"] == "dsh_action":
                 apply_dsh_action(job)
