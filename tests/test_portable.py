@@ -33,7 +33,8 @@ def wait_for(predicate, seconds=15):
 class PortableTests(unittest.TestCase):
     def test_install_upgrade_uninstall(self):
         with tempfile.TemporaryDirectory(prefix='中文 path ') as tmp:
-            home = Path(tmp)
+            # install() 内部会 resolve()；Windows 的 8.3 短路径不 resolve 时与长路径不相等。
+            home = Path(tmp).resolve()
             original = {'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': 'echo unrelated'}]}]},
                         'description': 'Keep this'}
             (home / 'hooks.json').write_text(json.dumps(original), encoding='utf-8')
@@ -62,7 +63,8 @@ class PortableTests(unittest.TestCase):
             self.assertTrue(list((home / 'auto-resume').glob('hooks.backup-*')))
 
     def test_installed_runtime_survives_clone_removal(self):
-        with tempfile.TemporaryDirectory(prefix='install 中文 ') as tmp:
+        # 后台执行器释放锁与进程真正退出之间有窗口，Windows 上可能仍占用 runner.log。
+        with tempfile.TemporaryDirectory(prefix='install 中文 ', ignore_cleanup_errors=True) as tmp:
             root = Path(tmp); clone = root/'clone'; home = root/'codex home'
             shutil.copytree(REPO/'src', clone)
             with patch.object(installer, 'SOURCE', clone), \
