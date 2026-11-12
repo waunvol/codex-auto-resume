@@ -21,8 +21,9 @@ import uuid
 
 RECHECK_SECONDS = 30
 RPC_TIMEOUT_SECONDS = 45
-ACTIVE_STATES = {"pending", "running", "waiting_quota", "waiting_dsh", "dsh_action", "watching"}
+ACTIVE_STATES = {"pending", "running", "waiting_quota", "waiting_thread", "waiting_dsh", "dsh_action", "watching"}
 DSH_RUNNER = os.environ.get("DSH_COLLAB_RUNNER")
+DSH_PROJECT_RUNNER = os.environ.get("DSH_PROJECT_RUNNER")
 RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -43,6 +44,10 @@ class Blocked(RunnerError):
 
 
 class ServerDisconnected(RunnerError):
+    pass
+
+
+class ThreadBusy(RunnerError):
     pass
 
 
@@ -122,7 +127,10 @@ class AppServer:
                 message = await self.receive()
                 if message.get("id") == request_id:
                     if "error" in message:
-                        raise RunnerError(f"{method}: {message['error']['message']}")
+                        detail = message['error']['message']
+                        if method == "thread/resume" and "already has an active writer" in detail:
+                            raise ThreadBusy(detail)
+                        raise RunnerError(f"{method}: {detail}")
                     return message["result"]
                 if on_event:
                     on_event(message)
@@ -205,21 +213,30 @@ def runner_alive(path):
 
 def dsh_command(job, *arguments):
     state = job.state
-    if not DSH_RUNNER or not Path(DSH_RUNNER).is_file():
+    project = state.get("dsh_project")
+    runner = (DSH_PROJECT_RUNNER or (str(Path(DSH_RUNNER).with_name("dsh_project.py")) if DSH_RUNNER else None)) if project else DSH_RUNNER
+    if not runner or not Path(runner).is_file():
         raise Blocked("DSH 为可选外部集成，请设置 DSH_COLLAB_RUNNER 为本机执行器路径。")
     process = subprocess.run(
-        [sys.executable, str(DSH_RUNNER), *arguments, "--id", state["dsh_job"]],
+        [sys.executable, str(runner), *arguments, "--id", project or state["dsh_job"]],
         env={**os.environ, "DSH_COLLAB_ROOT": state["dsh_root"]},
-        text=True, capture_output=True, timeout=30,
+        text=True, capture_output=True, timeout=660 if arguments[0] == "check" else 30,
     )
     if process.returncode:
         raise Blocked(f"DSH 工作包操作失败。{process.stderr.strip()}")
     return json.loads(process.stdout)
 
 
+def dsh_running(state, snapshot):
+    return bool(snapshot.get("running_count", 0)) if state.get("dsh_project") else snapshot["status"] == "running"
+
+
 def apply_dsh_action(job):
     """执行已落盘的动作，重启重放使用相同请求 ID。"""
     action = job.state["dsh_action"]
+    if job.state.get("dsh_project"):
+        apply_project_action(job, action)
+        return
     if action["kind"] == "followup":
         task = job.path.with_name(job.path.name + ".dsh-task.md")
         task.write_text(action["text"], encoding="utf-8")
@@ -235,9 +252,53 @@ def apply_dsh_action(job):
     report(f"DSH 动作已完成 {action['kind']}")
 
 
+def apply_project_action(job, action):
+    """项目计划由宿主预先登记；模型只能操作其中已有的任务。"""
+    kind = action["kind"]
+    if kind == "followup" and action.get("task") == "assistant":
+        raise Blocked("助手复核须使用 assist，followup 仅用于工程任务。")
+    request = ["--request-id", action["id"]]
+    if kind in ("assist", "followup"):
+        task = job.path.with_name(job.path.name + ".dsh-task.md")
+        task.write_text(action["text"], encoding="utf-8")
+        arguments = [kind, "--task-file", str(task)]
+        if kind == "followup":
+            arguments += ["--task", action["task"]]
+        result = dsh_command(job, *arguments, *request)
+    elif kind in ("accepted", "needs-changes", "blocked"):
+        arguments = ["review", "--task", action["task"], "--verdict", kind, "--note", action["text"]]
+        for finding in action["resolved"]:
+            arguments += ["--resolve", finding]
+        result = dsh_command(job, *arguments, *request)
+    elif kind == "finish":
+        result = dsh_command(job, "finish", "--verdict", "accepted", "--note", action["text"], *request)
+    elif kind in ("tick", "check"):
+        result = dsh_command(job, kind, *request)
+    else:
+        raise Blocked("未知的 DSH 项目动作。")
+    if job.state["after_dsh_action"] == "complete" and result["status"] != "complete":
+        raise Blocked("DSH 项目尚未通过最终验收。")
+    next_status = job.state["after_dsh_action"]
+    if kind == "blocked":
+        next_status = "blocked"
+    elif result["running_count"]:
+        next_status = "waiting_dsh"
+    job.save(status=next_status, dsh_action=None)
+    report(f"DSH 项目动作已完成 {kind}")
+
+
 def output_schema(job):
-    if not job.state.get("dsh_job"):
+    project = job.state.get("dsh_project")
+    if not job.state.get("dsh_job") and not project:
         return RESULT_SCHEMA
+    properties = {
+        "kind": {"type": "string", "enum": ["followup", "accepted", "needs-changes", "blocked"]},
+        "text": {"type": "string"},
+    }
+    if project:
+        properties["kind"]["enum"] += ["assist", "tick", "check", "finish"]
+        properties["task"] = {"type": "string"}
+        properties["resolved"] = {"type": "array", "items": {"type": "string"}}
     return {
         **RESULT_SCHEMA,
         "properties": {
@@ -245,10 +306,8 @@ def output_schema(job):
             "status": {"type": "string", "enum": ["complete", "continue", "blocked", "wait_dsh"]},
             "dsh_action": {"anyOf": [
                 {"type": "null"},
-                {"type": "object", "properties": {
-                    "kind": {"type": "string", "enum": ["followup", "accepted", "needs-changes", "blocked"]},
-                    "text": {"type": "string"},
-                }, "required": ["kind", "text"], "additionalProperties": False},
+                {"type": "object", "properties": properties,
+                 "required": list(properties), "additionalProperties": False},
             ]},
         },
         "required": ["status", "summary", "dsh_action"],
@@ -306,6 +365,9 @@ def settle_turn(job, turn, answer):
         raise Blocked("轮次结束，但任务验收结果不符合约定。")
     summary = result["summary"].strip()
     status = result["status"]
+    if job.state.get("dsh_project"):
+        settle_project_turn(job, result)
+        return
     if job.state.get("dsh_job"):
         worker = dsh_command(job, "status")
         action = result.get("dsh_action")
@@ -334,6 +396,38 @@ def settle_turn(job, turn, answer):
         raise Blocked(f"连续两轮报告相同进度，需要检查任务卡点。\n{summary}")
     job.save(status="pending" if status == "continue" else status, summary=summary, turn_id=None)
     report(f"{status}: {summary}")
+
+
+def settle_project_turn(job, result):
+    current = dsh_command(job, "status")
+    action = result.get("dsh_action")
+    status = result["status"]
+    summary = result["summary"].strip()
+    if action is not None:
+        if (not isinstance(action, dict)
+                or action.get("kind") not in ("assist", "followup", "tick", "check", "finish", "accepted", "needs-changes", "blocked")
+                or not isinstance(action.get("text"), str) or not action["text"].strip()
+                or not isinstance(action.get("task"), str)
+                or not isinstance(action.get("resolved"), list)
+                or any(not isinstance(item, str) for item in action["resolved"])
+                or (status == "complete" and action["kind"] != "finish")):
+            raise Blocked("DSH 项目动作与任务状态不一致。")
+        if action["kind"] in ("followup", "accepted", "needs-changes", "blocked") and action["task"] not in ["assistant", *[row["id"] for row in current["tasks"]]]:
+            raise Blocked("DSH 项目动作引用了未登记的任务。")
+        if action["kind"] == "followup" and action["task"] == "assistant":
+            raise Blocked("助手复核须使用 assist，followup 仅用于工程任务。")
+        job.save(status="dsh_action", summary=summary, turn_id=None,
+                 dsh_action={**action, "id": str(uuid.uuid4())},
+                 after_dsh_action="complete" if status == "complete" else "pending")
+        return
+    if status == "complete" and current["status"] != "complete":
+        raise Blocked("DSH 项目尚未通过最终验收。")
+    if status in ("continue", "wait_dsh") and current["running_count"]:
+        job.save(status="waiting_dsh", summary=summary, turn_id=None)
+        return
+    if status in ("continue", "wait_dsh") and summary == job.state.get("summary"):
+        raise Blocked(f"连续两轮报告相同进度，需要检查任务卡点。\n{summary}")
+    job.save(status="pending" if status in ("continue", "wait_dsh") else status, summary=summary, turn_id=None)
 
 
 async def recover_turn(server, job):
@@ -393,6 +487,19 @@ async def run_turn(server, job):
             "实际检查工作目录及测试结果，不以工程师自述代替验证。"
             "\n当前工作包\n" + json.dumps(worker, ensure_ascii=False)
         )
+    if state.get("dsh_project"):
+        project = dsh_command(job, "status")
+        prompt += (
+            "\n你负责这个已登记 DSH 项目的最终验收。助手发现是建议，须核对实际文件和测试证据。"
+            "只通过最终 JSON 的 dsh_action 请求宿主执行动作，不自行启动/验收工作包。"
+            "动作字段为 kind、text、task、resolved；无需指定任务时 task=空字符串，无处置时 resolved=[]。"
+            "kind=assist 请求助手复核当前证据；accepted/needs-changes/blocked 记录 task 的验收；"
+            "followup 为 task 提交完整返工单；tick 启动计划内依赖就绪任务；check 执行登记的集成检查；"
+            "finish 完成项目验收。重大助手发现须解决后复核或在 resolved 中列 ID 并用 text 写处置证据。"
+            "dsh_action=null 表示无动作，等待运行用 wait_dsh。只有项目全部通过才能 complete。"
+            "禁止扩大已登记范围；写任务的集成基线需人工/主 agent 核对后绑定。"
+            "\n当前项目\n" + json.dumps(project, ensure_ascii=False)
+        )
 
     try:
         extra, prompt_id = prompt_snapshot(control)
@@ -450,7 +557,7 @@ async def drive(server, job):
     if job.state["status"] == "running":
         await recover_turn(server, job)
     loaded = False
-    while job.state["status"] in {"pending", "running", "waiting_quota"}:
+    while job.state["status"] in {"pending", "running", "waiting_quota", "waiting_thread"}:
         if not check_watched_turn(job) or not permitted(job.path, job.state.get("applied_control_id")):
             return
         try:
@@ -539,23 +646,33 @@ async def run(job):
                 continue
             if job.state["status"] == "waiting_dsh":
                 worker = dsh_command(job, "status")
-                if worker["status"] == "running":
+                if dsh_running(job.state, worker):
                     await asyncio.sleep(2)
                     continue
                 job.save(status="pending")
-            if job.state.get("dsh_job") and job.state["status"] == "pending":
-                if dsh_command(job, "status")["status"] == "running":
+            if (job.state.get("dsh_job") or job.state.get("dsh_project")) and job.state["status"] == "pending":
+                worker = dsh_command(job, "status")
+                if dsh_running(job.state, worker):
                     job.save(status="waiting_dsh")
                     continue
             await drive_once(job)
         except Blocked as error:
             job.save(status="blocked", summary=str(error), retry_at=None)
             report(f"blocked: {error}")
+        except ThreadBusy as error:
+            message = "原客户端仍持有聊天写锁；等待其释放后自动重试。可关闭该聊天或退出原客户端，勿同时手动续跑。"
+            job.save(status="waiting_thread", retry_at=time.time() + RECHECK_SECONDS, summary=message)
+            report(f"{message} {error}")
         except ServerDisconnected as error:
-            if job.state["status"] != "waiting_quota":
-                raise
-            report(f"额度查询暂时失败，稍后复查。{error}")
-            job.save(retry_at=time.time() + RECHECK_SECONDS)
+            if job.state["status"] in ("waiting_quota", "waiting_thread"):
+                report(f"恢复连接暂时失败，稍后复查。{error}")
+                job.save(retry_at=time.time() + RECHECK_SECONDS)
+            else:
+                job.save(status="blocked", summary=str(error), retry_at=None)
+                report(f"blocked: {error}")
+        except RunnerError as error:
+            job.save(status="blocked", summary=str(error), retry_at=None)
+            report(f"blocked: {error}")
 
 
 def main():
@@ -576,6 +693,7 @@ def main():
     execute.add_argument("--allow-network", action="store_true", help="允许任务工具访问网络")
     execute.add_argument("--model", help="首次登记时指定本账户可用的 Codex 模型")
     execute.add_argument("--dsh-job", help="绑定已登记的单个 DSH 工作包")
+    execute.add_argument("--dsh-project", help="绑定已登记的 DSH 项目（与 --dsh-job 互斥）")
     execute.add_argument("--dsh-root", type=Path, help="工作包记录目录")
     execute.add_argument("--watch-rollout", type=Path,
                          help="守候 --thread-id 的本地记录，仅在当前轮次因额度失败后接手")
@@ -608,7 +726,7 @@ def main():
 
             if path.exists():
                 if any((args.task, args.cwd, args.thread_id, args.workspace_write, args.allow_network,
-                        args.model, args.dsh_job, args.dsh_root, args.watch_rollout)):
+                        args.model, args.dsh_job, args.dsh_project, args.dsh_root, args.watch_rollout)):
                     raise RunnerError("任务已登记，恢复时只传 --state。")
                 job = Job(path, json.loads(path.read_text(encoding="utf-8")))
             else:
@@ -617,13 +735,19 @@ def main():
                 prompt = args.task.read_text(encoding="utf-8").strip()
                 if not prompt:
                     raise RunnerError("任务单为空。")
-                if args.dsh_root and not args.dsh_job:
-                    raise RunnerError("--dsh-root 需要同时指定 --dsh-job。")
+                if args.dsh_job and args.dsh_project:
+                    raise RunnerError("--dsh-job 与 --dsh-project 不能同时指定。")
+                if args.dsh_root and not (args.dsh_job or args.dsh_project):
+                    raise RunnerError("--dsh-root 需要同时指定 --dsh-job 或 --dsh-project。")
                 job = Job(path, {})
                 dsh_root = str((args.dsh_root or Path(os.environ.get("DSH_COLLAB_ROOT")
                                or Path.home() / ".local/state/dsh-collab")).expanduser().resolve())
                 if args.dsh_job:
                     dsh_command(Job(path, {"dsh_job": args.dsh_job, "dsh_root": dsh_root}), "status")
+                if args.dsh_project:
+                    current = dsh_command(Job(path, {"dsh_project": args.dsh_project, "dsh_root": dsh_root}), "status")
+                    if Path(current["cwd"]).resolve() != args.cwd.resolve():
+                        raise RunnerError("绑定的 DSH 项目目录与 --cwd 不一致。")
                 initial = {}
                 if args.watch_rollout:
                     if not args.thread_id:
@@ -635,7 +759,7 @@ def main():
                 job.save(status="watching" if initial else "pending", prompt=prompt, cwd=str(args.cwd.resolve()),
                          thread_id=args.thread_id, workspace_write=args.workspace_write,
                          allow_network=args.allow_network, model=args.model,
-                         dsh_job=args.dsh_job, dsh_root=dsh_root, **initial)
+                         dsh_job=args.dsh_job, dsh_project=args.dsh_project, dsh_root=dsh_root, **initial)
 
             if job.state["status"] in ACTIVE_STATES:
                 if args.background:

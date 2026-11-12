@@ -22,6 +22,13 @@ for line in sys.stdin:
     log = root / method.replace('/', '_')
     count = int(log.read_text()) + 1 if log.exists() else 1
     log.write_text(str(count))
+    if method == 'thread/resume':
+        failure = os.environ.get('FAKE_CODEX_RESUME_ERROR')
+        if count <= int(os.environ.get('FAKE_CODEX_THREAD_BUSY_ATTEMPTS', '0')):
+            failure = f"thread {params['threadId']} already has an active writer"
+        if failure:
+            send({'id':msg['id'], 'error':{'code':-32603,'message':failure}})
+            continue
     if method == 'initialize':
         result = {}
     elif method == 'account/read':

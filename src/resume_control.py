@@ -81,7 +81,7 @@ if __name__ == '__main__':
         parser.error('设置任务时需要 --state 和 --mode')
     try:
         state=json.loads(args.state.read_text(encoding='utf-8'))
-        if state['status'] not in ('watching','pending','running','waiting_quota','waiting_dsh','dsh_action'):
+        if state['status'] not in ('watching','pending','running','waiting_quota','waiting_thread','waiting_dsh','dsh_action'):
             raise ValueError('任务已结束，不能重新激活')
         file=str(args.prompt_file.expanduser().resolve(strict=True)) if args.prompt_file else None
         current=read_control(args.state)

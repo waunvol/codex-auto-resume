@@ -37,7 +37,7 @@ def apply_control(data):
     path=state_root()/data['session']/data['turn']/'state.json'
     # 路径始终限制在当前用户任务目录内，不能将 ID 作为任意文件路径。
     if not path.is_file():raise ValueError('任务不存在')
-    if json.loads(path.read_text(encoding='utf-8'))['status'] not in ('watching','pending','running','waiting_quota','waiting_dsh','dsh_action'):
+    if json.loads(path.read_text(encoding='utf-8'))['status'] not in ('watching','pending','running','waiting_quota','waiting_thread','waiting_dsh','dsh_action'):
         raise ValueError('任务已结束，不能重新激活历史任务')
     control=write_control(path,data.get('mode'),data.get('prompt',''),data.get('approve',False))
     return control
