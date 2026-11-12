@@ -21,7 +21,7 @@ class ThreadBusyTests(unittest.TestCase):
     def setup_job(self, root):
         job = runner.Job(root / 'state.json', {})
         job.save(status='waiting_quota', retry_at=time.time() - 1, thread_id='existing',
-                 cwd=str(root), model=None, workspace_write=False, allow_network=False,
+                 cwd=str(root.resolve()), model=None, workspace_write=False, allow_network=False,
                  prompt='继续未完成任务')
         return job
 
