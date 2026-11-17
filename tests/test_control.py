@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock,patch
 from urllib.request import Request,urlopen
 from urllib.error import HTTPError
 
@@ -22,6 +22,69 @@ from resume_control import permitted,write_control,read_control
 
 
 class ControlTests(unittest.TestCase):
+    def test_recovery_sends_only_continue_and_unconsumed_custom_prompt(self):
+        # 覆盖旧 hook 状态和独立登记的后续轮次，检查实际 turn/start 输入。
+        for origin in ('hook','manual','dsh_job','dsh_project'):
+            for source in ('empty','inline','file'):
+                with self.subTest(origin=origin,source=source),tempfile.TemporaryDirectory() as d:
+                    root=Path(d).resolve();state=root/'state.json'
+                    job=runner.Job(state,{})
+                    job.save(status='pending',cwd=str(root),thread_id='existing',model=None,
+                             workspace_write=False,allow_network=False,
+                             prompt='旧版冗长恢复指令',summary='旧检查点不应重复附加')
+                    if origin=='hook':
+                        rollout=root/'rollout.jsonl'
+                        rows=[{'type':'session_meta','payload':{'id':'existing','cwd':str(root)}},
+                              {'type':'event_msg','payload':{'type':'task_complete','turn_id':'original',
+                               'error':{'codex_error_info':'usage_limit_exceeded'}}}]
+                        rollout.write_text(''.join(json.dumps(row)+'\n' for row in rows),encoding='utf-8')
+                        job.save(watch_rollout=str(rollout),watch_turn_id='original')
+                    else:
+                        job.save(applied_control_id='previous')
+                        if origin.startswith('dsh_'):
+                            job.save(**{origin:'existing-worker'})
+                    extra='' if source=='empty' else '先检查已有测试\n再继续剩余工作'
+                    file=None
+                    if source=='file':
+                        file=root/'prompt.md';file.write_text(extra,encoding='utf-8-sig')
+                    write_control(state,'auto',extra if source=='inline' else '',prompt_file=str(file) if file else None)
+                    captured=[]
+                    async def start(method,params,on_event):
+                        self.assertEqual(method,'turn/start')
+                        captured.append(params)
+                        turn={'id':'resumed','status':'completed'}
+                        on_event({'method':'turn/completed','params':{'threadId':'existing','turn':turn}})
+                        return {'turn':turn}
+                    server=AsyncMock();server.request.side_effect=start
+                    with patch.object(runner,'settle_turn'),patch.object(runner,'dsh_command') as dsh:
+                        asyncio.run(runner.run_turn(server,job))
+                        asyncio.run(runner.run_turn(server,job))
+                    self.assertEqual(captured[0]['input'],[{'type':'text','text':'继续任务'+('\n\n'+extra if extra else '')}])
+                    self.assertEqual(captured[1]['input'],[{'type':'text','text':'继续任务'}])
+                    self.assertEqual(captured[0]['outputSchema'],runner.output_schema(job))
+                    dsh.assert_not_called()
+
+    def test_dashboard_distinguishes_latest_round_from_old_blocked_round(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(dashboard,'state_root',return_value=Path(temp)):
+            for session,turn,status,registered,updated in [
+                    ('migration','old','blocked',100,600),
+                    ('migration','new','complete',200,300),
+                    ('other','only','blocked',150,500),
+                    ('broken','old','complete',100,100),
+                    ('broken','new',None,200,200)]:
+                folder=Path(temp)/session/turn;folder.mkdir(parents=True)
+                state=folder/'state.json';state.write_text(json.dumps({'status':status}) if status else '{invalid',encoding='utf-8')
+                event=folder/'event.json';event.write_text('{}',encoding='utf-8')
+                os.utime(state,(updated,updated));os.utime(event,(registered,registered))
+            data={(j['session'],j['turn']):j for j in dashboard.jobs()}
+            self.assertFalse(data['migration','old']['is_latest'])
+            self.assertTrue(data['migration','new']['is_latest'])
+            self.assertTrue(data['other','only']['is_latest'])
+            self.assertEqual(data['migration','old']['status'],'blocked')
+            self.assertTrue(data['broken','new']['is_latest'])
+            self.assertEqual(data['broken','new']['status'],'error')
+            self.assertFalse(data['broken','old']['is_latest'])
+
     def test_paused_job_still_recovers_already_submitted_turn(self):
         with tempfile.TemporaryDirectory() as d:
             state=Path(d)/'state.json';job=runner.Job(state,{})
@@ -61,7 +124,7 @@ class ControlTests(unittest.TestCase):
                     process.wait(timeout=15)
                     self.assertEqual(process.returncode,0,(root/'log').read_text(encoding='utf-8'))
                     data=json.loads((root/'calls/last_prompt.json').read_text(encoding='utf-8'))
-                    self.assertIn('追加：先检查已有测试',data['input'][0]['text'])
+                    self.assertEqual(data['input'][0]['text'],'original\n\n追加：先检查已有测试')
                     saved=json.loads(state.read_text(encoding='utf-8'))
                     self.assertEqual(saved['applied_control_id'],control['revision'])
                     self.assertFalse(permitted(state,control['revision']))

@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import time
+from urllib.parse import urlsplit
 
 
 def codex_home():
@@ -14,6 +16,73 @@ def codex_home():
 
 def state_root():
     return Path(os.environ.get('CODEX_RESUME_HOOK_ROOT') or codex_home() / 'auto-resume-state')
+
+
+def atomic_json(path, data):
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
+        atomic_replace(temp, path)
+    finally:
+        Path(temp).unlink(missing_ok=True)
+
+
+def save_preferences(home, changes):
+    """安装器及内嵌面板共用偏好文件，持锁合并，保留其他设置。"""
+    target = home.expanduser().resolve() / 'auto-resume'
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (target / 'install.lock').open('a+b') as lock:
+        lock_file(lock, blocking=True)
+        path = target / 'preferences.json'
+        settings = json.loads(path.read_text(encoding='utf-8-sig')) if path.exists() else {}
+        if not isinstance(settings, dict):
+            raise ValueError('preferences.json 必须是 JSON 对象')
+        atomic_json(path, {**settings, **changes})
+    return path
+
+
+def validate_proxy(value):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError('proxy 必须是 HTTP(S) 代理地址、inherit 或 direct')
+    value = value.strip()
+    if value in ('inherit', 'direct'):
+        return value
+    try:
+        parsed = urlsplit(value)
+        valid = (parsed.scheme in ('http', 'https') and parsed.hostname
+                 and (parsed.port is None or parsed.port > 0)
+                 and parsed.path in ('', '/') and not parsed.query and not parsed.fragment
+                 and not any(char.isspace() for char in value))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError('proxy 地址无效，请使用 http://主机:端口 或 https://主机:端口')
+    return value
+
+
+def codex_environment():
+    """每次连接前读取代理设置，不修改宿主或其他任务的进程环境。"""
+    env = dict(os.environ)
+    value = env.get('CODEX_RESUME_PROXY')
+    if value is None:
+        path = codex_home() / 'auto-resume/preferences.json'
+        settings = json.loads(path.read_text(encoding='utf-8-sig')) if path.exists() else {}
+        if not isinstance(settings, dict):
+            raise ValueError('preferences.json 必须是 JSON 对象')
+        value = settings.get('proxy', 'inherit')
+    value = validate_proxy(value)
+    if value == 'inherit':
+        return env
+    # 同时处理大小写及 ALL_PROXY，避免旧环境盖过显式选择。
+    for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
+        env.pop(key, None)
+    if value != 'direct':
+        env.update({key: value for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy')})
+        bypass = env.get('NO_PROXY', env.get('no_proxy', 'localhost,127.0.0.1,::1'))
+        env.update(NO_PROXY=bypass, no_proxy=bypass)
+    return env
 
 
 def lock_file(stream, blocking=False):

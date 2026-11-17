@@ -7,7 +7,7 @@ from resume_inbox import submitted_snapshot, clean_prompt
 import asyncio
 from collections import deque
 from datetime import datetime
-from resume_platform import lock_file, unlock_file, background_options, quiet_options, codex_command, codex_home, atomic_replace
+from resume_platform import lock_file, unlock_file, background_options, quiet_options, codex_command, codex_home, atomic_replace, codex_environment
 import hashlib
 import json
 import os
@@ -167,7 +167,10 @@ def latest_watched_turn(job):
             if (event.get("type") == "event_msg"
                     and payload.get("type") in ("task_started", "task_complete", "turn_aborted")
                     and payload.get("turn_id")
-                    and payload.get("root_turn_id", payload["turn_id"]) == payload["turn_id"]):
+                    and (payload.get("root_turn_id", payload["turn_id"]) == payload["turn_id"]
+                         # 原客户端工具发来的新输入会继承发送方 root，但仍是本聊天的新轮次。
+                         or (payload.get("turn_attribution") or {}).get("turn_trigger") == "app_tool_send_message"
+                         or payload["turn_id"] == (job.rollout_turn or {}).get("turn_id"))):
                 job.rollout_turn = payload
             job.rollout_offset = stream.tell()
     if job.rollout_turn is None:
@@ -464,18 +467,10 @@ async def run_turn(server, job):
     if state["workspace_write"]:
         sandbox["writableRoots"] = [state["cwd"]]
 
-    # 每轮先核对已落盘的成果和工程师状态，再从仍未完成的工作继续。
-    prompt = (
-        f"{state['prompt']}\n\n"
-        "这是一个可恢复任务。先检查当前文件和既有运行记录，已完成的步骤不要重跑。"
-        "若已有 dsh 工作包，先查其会话、进程或产物，再决定是否需要派工。"
-        "依据实际证据返回状态和摘要。complete 表示全部验收条件满足。"
-        "continue 表示本轮有可验证进展且还有下一步，摘要写明进展和下一步。"
-        "blocked 表示需要人工决策、授权或外部条件变化。"
-    )
-    if state.get("summary"):
-        prompt += f"\n上一轮检查点\n{state['summary']}"
-    if state.get("dsh_job"):
+    # 恢复沿用原聊天上下文；只有手工登记的首次提交才发送任务单及宿主动作约定。
+    first_task = not state.get("watch_rollout") and "applied_control_id" not in state
+    prompt = state["prompt"] if first_task else "继续任务"
+    if first_task and state.get("dsh_job"):
         worker = dsh_command(job, "status")
         prompt += (
             "\n你负责验收这个已授权工作包。执行器在宿主机代办下面的动作。"
@@ -487,7 +482,7 @@ async def run_turn(server, job):
             "实际检查工作目录及测试结果，不以工程师自述代替验证。"
             "\n当前工作包\n" + json.dumps(worker, ensure_ascii=False)
         )
-    if state.get("dsh_project"):
+    if first_task and state.get("dsh_project"):
         project = dsh_command(job, "status")
         prompt += (
             "\n你负责这个已登记 DSH 项目的最终验收。助手发现是建议，须核对实际文件和测试证据。"
@@ -506,7 +501,7 @@ async def run_turn(server, job):
     except (OSError, ValueError) as error:
         raise Blocked(f"无法读取恢复 prompt 文件：{error}") from error
     if prompt_id != state.get('applied_prompt_id') and extra.strip():
-        prompt += "\n用户追加的恢复指令（遵守原授权边界）：\n" + extra
+        prompt += "\n\n" + extra
     events = deque()
 
     def keep_event(message):
@@ -565,10 +560,14 @@ async def drive(server, job):
         except (Blocked, ServerDisconnected):
             raise
         except RunnerError as error:
-            if job.state["status"] != "waiting_quota":
+            # 额度查询的传输失败/超时可重试；认证、协议等错误仍交回人工。
+            temporary = any(marker in str(error).lower() for marker in (
+                "error sending request", "connection reset", "connection refused", "timed out", "超时"))
+            if job.state["status"] not in ("waiting_quota", "waiting_thread") or not temporary:
                 raise
-            report(f"额度查询暂时失败，稍后复查。{error}")
-            job.save(retry_at=time.time() + RECHECK_SECONDS)
+            message = f"额度查询暂时失败，{RECHECK_SECONDS} 秒后复查。{error}"
+            report(message)
+            job.save(retry_at=time.time() + RECHECK_SECONDS, summary=message)
             return
         deadline = quota_deadline(limits)
         if not deadline and job.state["status"] == "waiting_quota" and job.state["retry_at"] is None:
@@ -585,12 +584,29 @@ async def drive(server, job):
                 if Path(existing["cwd"]).resolve() != Path(job.state["cwd"]):
                     raise Blocked("现有会话的工作目录与登记目录不一致。")
                 if existing["status"]["type"] == "active":
-                    raise Blocked("现有会话正在执行，需先确认其结果。")
-                await server.request("thread/resume", {
+                    raise ThreadBusy("原会话仍在执行或释放中，等待其空闲后再接手。")
+                resume_params = {
                     "threadId": thread_id, "approvalPolicy": "never",
                     "sandbox": "workspace-write" if job.state["workspace_write"] else "read-only",
                     **({"model": job.state["model"]} if job.state.get("model") else {}),
-                })
+                }
+                try:
+                    await server.request("thread/resume", resume_params)
+                except ThreadBusy:
+                    if not read_control(job.path).get('desktop_unlock'):
+                        raise
+                    source_turn = job.state.get('watch_turn_id')
+                    if not source_turn:
+                        if not existing.get('path'):
+                            raise Blocked('无法核对原轮次，未执行桌面解锁。')
+                        probe = Job(job.path, {'watch_rollout':existing['path'], 'thread_id':thread_id,
+                                              'cwd':job.state['cwd']})
+                        source_turn = latest_watched_turn(probe)['turn_id']
+                    await release_desktop_writer(job, source_turn)
+                    if not check_watched_turn(job) or not permitted(job.path, job.state.get('applied_control_id')):
+                        return
+                    # 同一进程立即接管释放后的写锁；若再次占用，外层仍按 30 秒重试。
+                    await server.request("thread/resume", resume_params)
             else:
                 result = await server.request("thread/start", {
                     "cwd": job.state["cwd"],
@@ -606,11 +622,53 @@ async def drive(server, job):
         await run_turn(server, job)
 
 
+async def desktop_request(job, request):
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, '-X', 'utf8', str(Path(__file__).with_name('resume_desktop.py')),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        **quiet_options())
+    try:
+        output, _ = await asyncio.wait_for(process.communicate(json.dumps(request).encode()), 45)
+    except asyncio.TimeoutError as error:
+        process.kill(); await process.communicate()
+        raise Blocked('桌面释放锁操作超时，已保留还原检查点；重新运行同一状态文件先还原聊天。') from error
+    try:
+        result = json.loads(output)
+    except ValueError as error:
+        raise Blocked('桌面控制进程未返回有效结果，已保留还原检查点。') from error
+    if process.returncode or not result.get('restored'):
+        if not request.get('restore_only') and result.get('needs_restore') is False:
+            job.save(desktop_unlock_pending=None)
+        if result.get('changed'):
+            raise ThreadBusy(result.get('error','聊天状态已经改变。'))
+        raise Blocked(result.get('error','桌面控制失败。'))
+    return result
+
+
+async def release_desktop_writer(job, source_turn):
+    request = {'thread_id':job.state['thread_id'], 'turn_id':source_turn}
+    # 原子保存还原意图。进程或 IPC 中断后先还原，再读取可能临时移动的 rollout。
+    job.save(desktop_unlock_pending=request)
+    try:
+        await desktop_request(job, request)
+    except ThreadBusy:
+        # 前置检查拒绝，尚未归档，不需要还原。
+        job.save(desktop_unlock_pending=None)
+        raise
+    job.save(desktop_unlock_pending=None, desktop_unlock_at=time.time(),
+             summary='原桌面聊天已卸载并还原，正在由脚本接管。')
+    report('原桌面写锁已释放，聊天 ID 和历史保持不变。')
+
+
 async def drive_once(job):
+    try:
+        environment = codex_environment()
+    except (ValueError, OSError) as error:
+        raise Blocked(f"无法读取代理配置：{error}") from error
     process = await asyncio.create_subprocess_exec(
         *codex_command(), "app-server", "--listen", "stdio://",
         **quiet_options(),
-        env={**os.environ, "CODEX_AUTO_RESUME_CHILD": "1"},
+        env={**environment, "CODEX_AUTO_RESUME_CHILD": "1"},
         cwd=job.state["cwd"], stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, limit=16 * 1024 * 1024,
     )
@@ -628,8 +686,13 @@ async def drive_once(job):
 
 async def run(job):
     # 等待期间只保留本地计时器，到点再启动 App Server 复查额度。
-    while job.state["status"] in ACTIVE_STATES:
+    while job.state["status"] in ACTIVE_STATES or job.state.get('desktop_unlock_pending'):
         try:
+            if job.state.get('desktop_unlock_pending'):
+                await desktop_request(job, {**job.state['desktop_unlock_pending'], 'restore_only':True})
+                job.save(desktop_unlock_pending=None)
+                if job.state['status'] not in ACTIVE_STATES:
+                    return
             if not check_watched_turn(job):
                 if job.state["status"] == "watching":
                     await asyncio.sleep(2)
@@ -659,6 +722,8 @@ async def run(job):
         except Blocked as error:
             job.save(status="blocked", summary=str(error), retry_at=None)
             report(f"blocked: {error}")
+            if job.state.get('desktop_unlock_pending'):
+                return
         except ThreadBusy as error:
             message = "原客户端仍持有聊天写锁；等待其释放后自动重试。可关闭该聊天或退出原客户端，勿同时手动续跑。"
             job.save(status="waiting_thread", retry_at=time.time() + RECHECK_SECONDS, summary=message)
@@ -761,7 +826,7 @@ def main():
                          allow_network=args.allow_network, model=args.model,
                          dsh_job=args.dsh_job, dsh_project=args.dsh_project, dsh_root=dsh_root, **initial)
 
-            if job.state["status"] in ACTIVE_STATES:
+            if job.state["status"] in ACTIVE_STATES or job.state.get('desktop_unlock_pending'):
                 if args.background:
                     # 子进程独立于调用者会话；返回前确认其已持有执行锁。
                     unlock_file(lock)

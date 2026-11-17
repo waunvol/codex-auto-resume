@@ -19,14 +19,29 @@ def jobs():
     from codex_auto_resume import runner_alive
     result=[]
     for p in state_root().glob('*/*/state.json'):
+        registered_at=0
         try:
+            # event 只在登记时写入；旧守候后来更新 state 不能反过来成为“最新轮次”。
+            event=p.with_name('event.json')
+            registered_at=(event if event.exists() else p).stat().st_mtime
             state=json.loads(p.read_text(encoding='utf-8'))
             result.append({'session':p.parent.parent.name,'turn':p.parent.name,
+                           'registered_at':registered_at,
                            'state_file':str(p.resolve()), 'title':state.get('title'), 'inbox_file':state.get('inbox_file'), 'status':state['status'],'cwd':state.get('cwd'),'summary':state.get('summary'),
                            'retry_at':state.get('retry_at'),'runner_alive':runner_alive(p),
                            'applied_control_id':state.get('applied_control_id'), 'control':read_control(p)})
         except (OSError,ValueError,KeyError) as e:
-            result.append({'session':p.parent.parent.name,'turn':p.parent.name,'status':'error','summary':str(e)})
+            result.append({'session':p.parent.parent.name,'turn':p.parent.name,
+                           'registered_at':registered_at,'status':'error','summary':str(e)})
+    latest={}
+    for item in result:
+        session=item['session']
+        if session not in latest or (item.get('registered_at',0),item['turn'])>(latest[session].get('registered_at',0),latest[session]['turn']):
+            latest[session]=item
+    for item in result:
+        # 无法确定登记时间的 IO 错误仍显示，不能误藏到历史中。
+        if item['registered_at']:
+            item['is_latest']=item is latest[item['session']]
     return result
 
 
@@ -39,7 +54,8 @@ def apply_control(data):
     if not path.is_file():raise ValueError('任务不存在')
     if json.loads(path.read_text(encoding='utf-8'))['status'] not in ('watching','pending','running','waiting_quota','waiting_thread','waiting_dsh','dsh_action'):
         raise ValueError('任务已结束，不能重新激活历史任务')
-    control=write_control(path,data.get('mode'),data.get('prompt',''),data.get('approve',False))
+    control=write_control(path,data.get('mode'),data.get('prompt',''),data.get('approve',False),
+                          desktop_unlock=data.get('desktop_unlock'))
     return control
 
 

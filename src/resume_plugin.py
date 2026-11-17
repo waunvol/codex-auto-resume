@@ -15,10 +15,10 @@ def build_plugin(runtime, root=None):
     (plugin/'.codex-plugin').mkdir(parents=True,exist_ok=True)
     catalog=root/'.agents/plugins';catalog.mkdir(parents=True,exist_ok=True)
     def save(path,data):path.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
-    save(plugin/'.codex-plugin/plugin.json',{'name':NAME,'version':'0.3.0',
-         'description':'本机 Codex 额度恢复控制台：状态、确认恢复、追加 prompt。',
+    save(plugin/'.codex-plugin/plugin.json',{'name':NAME,'version':'0.4.0',
+         'description':'本机 Codex 恢复控制台：代理设置、桌面写锁释放、确认恢复、追加 prompt。',
          'mcpServers':'./.mcp.json','interface':{'displayName':'Codex 恢复控制台',
-         'shortDescription':'查看任务并控制额度恢复后的执行','capabilities':['Interactive','Read','Write']}})
+         'shortDescription':'配置代理、释放聊天锁并控制恢复','capabilities':['Interactive','Read','Write']}})
     save(plugin/'.mcp.json',{'mcpServers':{'resume':{'command':sys.executable,
          'args':['-X','utf8',str(runtime/'resume_mcp.py')],
          'env':{'CODEX_HOME':str(runtime.parents[2])},

@@ -10,25 +10,13 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timezone
 
 SOURCE = Path(__file__).resolve().parent / 'src'
 sys.path.insert(0, str(SOURCE))
-from resume_platform import codex_home, lock_file, resolve_codex, quiet_options, atomic_replace
+from resume_platform import codex_home, lock_file, resolve_codex, quiet_options, atomic_json, save_preferences, validate_proxy
 
-FILES = ('codex_auto_resume.py', 'codex_resume_hook.py', 'resume_platform.py', 'resume_control.py', 'resume_dashboard.py', 'dashboard.html', 'resume_mcp.py', 'resume_plugin.py', 'resume_inbox.py')
-
-
-def atomic_json(path, data):
-    fd, temp = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name)
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write('\n'); f.flush(); os.fsync(f.fileno())
-        atomic_replace(temp, path)
-    finally:
-        Path(temp).unlink(missing_ok=True)
+FILES = ('codex_auto_resume.py', 'codex_resume_hook.py', 'resume_platform.py', 'resume_control.py', 'resume_dashboard.py', 'dashboard.html', 'resume_mcp.py', 'resume_plugin.py', 'resume_inbox.py', 'resume_desktop.py')
 
 
 def hook_command(python, script, windows=None):
@@ -131,6 +119,8 @@ def main():
     parser.add_argument('--codex-executable', help='codex/codex.exe 或官方 npm codex.cmd 的绝对路径')
     parser.add_argument('--runtime', choices=['auto','desktop','cli'], default='auto', help='只安装桌面端时可选 desktop，无需另外安装 CLI')
     parser.add_argument('--prompt-dir',type=Path,help='任务开始时在此目录按标题创建可编辑的恢复 prompt 文件')
+    parser.add_argument('--configure-proxy', metavar='URL|inherit|direct',
+                        help='仅保存代理设置，不重装 hooks；支持 HTTP(S) 地址、继承环境或直连')
     parser.add_argument('--plugin', action='store_true', help='安装桌面内嵌 MCP Apps 插件，不启动 HTTP 面板')
     parser.add_argument('--dashboard', action='store_true', help='重新启动或显示已安装的本地面板链接')
     parser.add_argument('--no-dashboard', action='store_true', help='安装时暂不启动本地状态面板')
@@ -139,6 +129,14 @@ def main():
     args = parser.parse_args()
     if sys.version_info < (3, 10):
         parser.error('需要 Python 3.10 或更新版本')
+    if args.configure_proxy is not None:
+        if (args.uninstall or args.dashboard or args.plugin or args.prompt_dir
+                or args.codex_executable or args.replace_hook_command or args.runtime != 'auto'):
+            parser.error('--configure-proxy 仅保存配置，请与安装/卸载操作分开运行')
+        path = save_preferences(args.codex_home, {'proxy': validate_proxy(args.configure_proxy)})
+        print('代理配置已保存：' + str(path))
+        print('支持此配置的执行器会在下次连接 Codex 时读取；已建立的连接不受影响。')
+        return 0
     if args.dashboard:
         if args.uninstall:
             parser.error('--dashboard 不能与 --uninstall 同时使用')
@@ -151,7 +149,7 @@ def main():
     result = install(args.codex_home, args.codex_executable, args.uninstall, args.replace_hook_command, args.runtime)
     if args.prompt_dir and not args.uninstall:
         prompt_dir=args.prompt_dir.expanduser().resolve(); prompt_dir.mkdir(parents=True,exist_ok=True)
-        atomic_json(args.codex_home.expanduser().resolve()/'auto-resume/preferences.json',{'prompt_dir':str(prompt_dir)})
+        save_preferences(args.codex_home, {'prompt_dir': str(prompt_dir)})
         print('任务 prompt 目录：'+str(prompt_dir))
     print('已卸载 hooks；历史记录和备份保留。' if args.uninstall else
           '安装完成。桌面端请到 Settings > Hooks 信任并启用 UserPromptSubmit、Stop；CLI 使用 /hooks。重启已打开的 App。')

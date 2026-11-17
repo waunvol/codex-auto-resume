@@ -7,7 +7,8 @@ import tempfile
 import uuid
 from resume_platform import atomic_replace, lock_file
 
-DEFAULT = {'mode': 'auto', 'prompt': '', 'approved': False, 'revision': None, 'prompt_file': None}
+DEFAULT = {'mode': 'auto', 'prompt': '', 'approved': False, 'revision': None, 'prompt_file': None,
+           'desktop_unlock': False}
 
 
 def read_control(state_path):
@@ -15,17 +16,21 @@ def read_control(state_path):
     return {**DEFAULT, **json.loads(path.read_text(encoding='utf-8'))} if path.exists() else dict(DEFAULT)
 
 
-def write_control(state_path, mode, prompt, approve=False, prompt_file=None):
+def write_control(state_path, mode, prompt, approve=False, prompt_file=None, desktop_unlock=None):
     if mode not in ('auto', 'confirm', 'off') or not isinstance(prompt, str) or len(prompt)>20000:
         raise ValueError('恢复模式无效，或 prompt 超过 20000 字符')
     if not isinstance(approve, bool):
         raise ValueError('approve 必须是布尔值')
+    if desktop_unlock is not None and not isinstance(desktop_unlock,bool):
+        raise ValueError('desktop_unlock 必须是布尔值')
     if prompt_file is not None and (not isinstance(prompt_file,str) or not Path(prompt_file).is_absolute()):
         raise ValueError('prompt 文件必须使用绝对路径')
     path = Path(state_path).with_name('control.json')
     with path.with_suffix('.lock').open('a+b') as lock:
         lock_file(lock, blocking=True)
-        control = {'mode': mode, 'prompt': prompt, 'approved': approve, 'revision': str(uuid.uuid4()), 'prompt_file': prompt_file}
+        unlock = read_control(state_path)['desktop_unlock'] if desktop_unlock is None else desktop_unlock
+        control = {'mode': mode, 'prompt': prompt, 'approved': approve, 'revision': str(uuid.uuid4()),
+                   'prompt_file': prompt_file, 'desktop_unlock':unlock}
         store_control(path,control)
         return control
 
@@ -72,6 +77,11 @@ if __name__ == '__main__':
     parser.add_argument('--mode',choices=['auto','confirm','off'])
     parser.add_argument('--prompt-file',type=Path)
     parser.add_argument('--approve',action='store_true')
+    unlocking=parser.add_mutually_exclusive_group()
+    unlocking.add_argument('--desktop-unlock',dest='desktop_unlock',action='store_true',
+                           help='授权闲置聊天临时归档并还原，以便脚本接管写锁')
+    unlocking.add_argument('--no-desktop-unlock',dest='desktop_unlock',action='store_false')
+    parser.set_defaults(desktop_unlock=None)
     args=parser.parse_args()
     if args.list:
         from resume_dashboard import jobs
@@ -85,7 +95,8 @@ if __name__ == '__main__':
             raise ValueError('任务已结束，不能重新激活')
         file=str(args.prompt_file.expanduser().resolve(strict=True)) if args.prompt_file else None
         current=read_control(args.state)
-        result=write_control(args.state,args.mode,current['prompt'],args.approve,file or current.get('prompt_file'))
+        result=write_control(args.state,args.mode,current['prompt'],args.approve,file or current.get('prompt_file'),
+                             desktop_unlock=args.desktop_unlock)
         print(json.dumps(result,ensure_ascii=False,indent=2))
     except (OSError,ValueError,KeyError) as e:
         parser.exit(1,str(e)+'\n')

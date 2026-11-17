@@ -37,8 +37,7 @@ def worker(folder):
                      thread_id=event['session_id'], watch_turn_id=event['turn_id'],
                      watch_rollout=event['transcript_path'], retry_at=None, turn_id=None,
                      model=event.get('model'), workspace_write=False, allow_network=False,
-                     prompt='继续本会话中因额度中断的用户任务。先核对已有成果，只完成剩余工作；'
-                            '遵守原任务范围和授权，不重复已完成操作。遇到缺失权限或人工决策返回 blocked。')
+                     prompt='继续任务')
             deadline = time.monotonic() + 30
             while True:
                 try:
@@ -64,7 +63,7 @@ def worker(folder):
                 policy = context.get('sandbox_policy') or {}
                 job.save(workspace_write=policy.get('type') == 'workspace-write')
         create_prompt(job, event.get('title') or 'Codex任务')
-        if job.state['status'] not in runner.ACTIVE_STATES:
+        if job.state['status'] not in runner.ACTIVE_STATES and not job.state.get('desktop_unlock_pending'):
             return
         # 同一聊天的新轮次等待旧守候观察到新事件并释放锁；不同聊天互不等待。
         deadline = time.monotonic() + 10
